@@ -215,34 +215,60 @@ export function masterOrder(master) {
 
 /**
  * Menentukan posisi baru sebuah baris setelah dikoreksi.
- * `rows` = semua baris data KECUALI baris yang dikoreksi: { row, level1, level2, level3, nama }.
+ * Mendukung hierarki penuh: Level 1 -> Level 2 -> Level 3 -> Nama Produk -> Spesifikasi.
+ * Baris yang dikoreksi dipindahkan ke paling bawah dari kelompok yang cocok.
+ * `rows` = semua baris data KECUALI baris yang dikoreksi: { row, level1, level2, level3, nama, spesifikasi }.
  * Hasil: indeks baris (absolut) tempat baris disisipkan SEBELUM-nya, atau null bila tetap di tempat.
  */
 export function computeMoveTarget(rows, self, orig, updated, order) {
-  const sameGroup = keyOf(orig.level1) === keyOf(updated.level1) && keyOf(orig.level2) === keyOf(updated.level2) && keyOf(orig.level3) === keyOf(updated.level3);
-  if (sameGroup && keyOf(orig.nama) === keyOf(updated.nama)) return null;
-  const me = pathKey(updated.level1, updated.level2, updated.level3);
-  const group = rows.filter(r => pathKey(r.level1, r.level2, r.level3) === me);
+  const u1 = keyOf(updated.level1), u2 = keyOf(updated.level2), u3 = keyOf(updated.level3);
+  const un = keyOf(updated.nama), us = keyOf(updated.spesifikasi);
+
   let insertBefore = null;
-  if (group.length) {
-    const byName = group.filter(r => keyOf(r.nama) === keyOf(updated.nama));
-    const anchor = byName.length ? byName : group;
-    insertBefore = Math.max(...anchor.map(r => r.row)) + 1;
+
+  // 1. Cocok sampai ke Spesifikasi: taruh di bawah baris terakhir spesifikasi tersebut
+  const mSpek = rows.filter(r => keyOf(r.level1) === u1 && keyOf(r.level2) === u2 && keyOf(r.level3) === u3 && keyOf(r.nama) === un && keyOf(r.spesifikasi) === us);
+  if (mSpek.length) {
+    insertBefore = Math.max(...mSpek.map(r => r.row)) + 1;
   } else {
-    const mine = order.get(me);
-    if (mine === undefined) return null;
-    const known = rows.map(r => ({ r, key: order.get(pathKey(r.level1, r.level2, r.level3)) })).filter(k => k.key !== undefined);
-    if (!known.length) return null;
-    const before = known.filter(k => k.key <= mine);
-    if (before.length) {
-      const best = Math.max(...before.map(k => k.key));
-      insertBefore = Math.max(...before.filter(k => k.key === best).map(k => k.r.row)) + 1;
+    // 2. Cocok sampai ke Nama Produk: taruh di bawah baris terakhir nama produk tersebut
+    const mNama = rows.filter(r => keyOf(r.level1) === u1 && keyOf(r.level2) === u2 && keyOf(r.level3) === u3 && keyOf(r.nama) === un);
+    if (mNama.length) {
+      insertBefore = Math.max(...mNama.map(r => r.row)) + 1;
     } else {
-      const first = Math.min(...known.map(k => k.key));
-      insertBefore = Math.min(...known.filter(k => k.key === first).map(k => k.r.row));
+      // 3. Cocok sampai ke Level 3: taruh di bawah baris terakhir Level 3 tersebut
+      const mL3 = rows.filter(r => keyOf(r.level1) === u1 && keyOf(r.level2) === u2 && keyOf(r.level3) === u3);
+      if (mL3.length) {
+        insertBefore = Math.max(...mL3.map(r => r.row)) + 1;
+      } else {
+        // 4. Cari berdasarkan urutan di Master_Level jika kelompok Level 3 belum ada di tabel
+        const me = pathKey(updated.level1, updated.level2, updated.level3);
+        const mine = order?.get(me);
+        if (mine !== undefined) {
+          const known = rows.map(r => ({ r, key: order.get(pathKey(r.level1, r.level2, r.level3)) })).filter(k => k.key !== undefined);
+          if (known.length) {
+            const before = known.filter(k => k.key <= mine);
+            if (before.length) {
+              const best = Math.max(...before.map(k => k.key));
+              insertBefore = Math.max(...before.filter(k => k.key === best).map(k => k.r.row)) + 1;
+            } else {
+              const first = Math.min(...known.map(k => k.key));
+              insertBefore = Math.min(...known.filter(k => k.key === first).map(k => k.r.row));
+            }
+          }
+        }
+        // 5. Fallback ke Level 2 jika Level 3 belum ada sama sekali
+        if (insertBefore === null) {
+          const mL2 = rows.filter(r => keyOf(r.level1) === u1 && keyOf(r.level2) === u2);
+          if (mL2.length) insertBefore = Math.max(...mL2.map(r => r.row)) + 1;
+        }
+      }
     }
   }
-  if (insertBefore === self.row || insertBefore === self.row + 1) return null;
+
+  if (insertBefore === null) return null;
+  const finalRow = finalRowAfterMove(self.row, insertBefore);
+  if (finalRow === self.row) return null;
   return insertBefore;
 }
 

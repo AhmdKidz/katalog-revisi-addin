@@ -49,17 +49,26 @@ test('diffFields hanya melaporkan kolom yang berubah', () => {
 });
 
 // Baris data mulai indeks 1 (judul di indeks 0).
-const R = (row, level2, level3, nama) => ({ row, level1: 'Supplier', level2, level3, nama });
+const R = (row, level2, level3, nama, spesifikasi = '') => ({ row, level1: 'Supplier', level2, level3, nama, spesifikasi });
 const S = 'Material Semen, Beton & Grout', B = 'Baja & Besi', P = 'Produk Beton Pracetak & Prategang';
 const order = masterOrder(master);
 
-test('computeMoveTarget: pindah ke kelompok Level 3 yang sama (setelah nama sama)', () => {
-  const rows = [R(1, S, 'Semen', 'Semen'), R(2, S, 'Semen', 'Semen'), R(3, S, 'Ready Mix', 'Beton'), R(4, B, 'Besi Beton', 'Besi 10'), R(6, P, 'Tiang Pancang', 'Tiang')];
-  const orig = { level1: 'Supplier', level2: P, level3: 'Tiang Pancang', nama: 'Semen' };
-  const upd = { level1: 'Supplier', level2: S, level3: 'Semen', nama: 'Semen' };
-  const target = computeMoveTarget(rows, { row: 5 }, orig, upd, order);
-  assert.equal(target, 3);
-  assert.equal(finalRowAfterMove(5, 3), 3);
+test('computeMoveTarget: perubahan spesifikasi pindah ke bawah baris terakhir spesifikasi tersebut', () => {
+  const rows = [
+    R(2, S, 'Semen', 'Semen', 'Merah Putih'),
+    R(3, S, 'Semen', 'Semen', '1; Tipe 1'),
+    R(5, S, 'Semen', 'Semen', 'OPC'),
+    R(6, S, 'Semen', 'Semen', 'PCC; Curah'),
+    R(7, S, 'Semen', 'Semen', 'PCC; Curah'),
+    R(8, S, 'Semen', 'Semen', 'PCC; Curah'),
+    R(9, S, 'Semen', 'Semen', 'PCC; Curah'),
+    R(10, S, 'Semen', 'Semen', 'PCC; Jumbo Bag')
+  ];
+  const orig = { level1: 'Supplier', level2: S, level3: 'Semen', nama: 'Semen', spesifikasi: 'Merah Putih' };
+  const upd = { level1: 'Supplier', level2: S, level3: 'Semen', nama: 'Semen', spesifikasi: 'PCC; Curah' };
+  const target = computeMoveTarget(rows, { row: 4 }, orig, upd, order);
+  assert.equal(target, 10); // disisipkan sebelum baris 10
+  assert.equal(finalRowAfterMove(4, target), 9); // posisi akhir setelah pindah adalah baris 9 (bawah baris 9 lama)
 });
 
 test('computeMoveTarget: Level 3 baru di Level 2 yang sama mengikuti urutan master', () => {
@@ -69,12 +78,10 @@ test('computeMoveTarget: Level 3 baru di Level 2 yang sama mengikuti urutan mast
   assert.equal(computeMoveTarget(rows, { row: 4 }, orig, upd, order), 3); // setelah baris Semen terakhir (2)
 });
 
-test('computeMoveTarget: tidak pindah bila kelompok & nama sama, atau sudah di posisi benar', () => {
-  const rows = [R(1, S, 'Semen', 'Semen'), R(3, S, 'Semen', 'Semen')];
-  const o = { level1: 'Supplier', level2: S, level3: 'Semen', nama: 'Semen' };
+test('computeMoveTarget: tidak pindah bila sudah di posisi paling bawah kelompoknya', () => {
+  const rows = [R(1, S, 'Semen', 'Semen', 'OPC')];
+  const o = { level1: 'Supplier', level2: S, level3: 'Semen', nama: 'Semen', spesifikasi: 'OPC' };
   assert.equal(computeMoveTarget(rows, { row: 2 }, o, { ...o }, order), null);
-  const orig = { ...o, nama: 'Lain' };
-  assert.equal(computeMoveTarget([R(1, S, 'Semen', 'Semen')], { row: 2 }, orig, o, order), null); // sudah tepat setelah baris 1
 });
 
 test('valueOptions memprioritaskan kelompok yang sama', () => {
