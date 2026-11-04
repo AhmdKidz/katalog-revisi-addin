@@ -2,13 +2,18 @@
 import { CONFIG, CORRECTION_HEADERS, FIELD_LABELS, LOG_HEADERS } from './config.js';
 import { createCombo } from './combobox.js';
 import {
-  checkClassification, computeMoveTarget, detectLayout, diffFields, filterPaths, finalRowAfterMove, findLevel2, findPath, formatTime,
-  keyOf, level1List, level2Entries, masterOrder, parseMaster, pathProblem, planCorrectionColumns, safeText, suggest, tidy, valueOptions
+  checkClassification, computeMoveTarget, createVocabularyStore, detectLayout, diffFields, filterPaths, finalRowAfterMove, findLevel2, findPath, formatTime,
+  keyOf, level1List, level2Entries, masterOrder, parseMaster, pathProblem, planCorrectionColumns, recordVocabulary, safeText, suggest, tidy, valueOptions
 } from './core.js';
 
 const $ = id => document.getElementById(id);
 const COPY_FIELDS = ['level1', 'kode2', 'level2', 'level3', 'nama', 'spesifikasi'];
-const state = { master: null, order: null, layout: null, sheetId: null, sheetName: '', lastRow: 0, rowIndex: -1, row: null, multi: false, index: null, indexSheetId: null, orig: null, draft: null, rowKey: '', busy: false };
+const state = {
+  master: null, order: null, layout: null, sheetId: null, sheetName: '', lastRow: 0,
+  rowIndex: -1, row: null, multi: false, index: null, indexSheetId: null,
+  orig: null, draft: null, rowKey: '', busy: false,
+  vocabulary: createVocabularyStore()
+};
 let queue = Promise.resolve(), selectionTimer, noteTimer, pendingNote = null;
 
 function tell(text, error = false) { $('message').textContent = text; $('message').classList.toggle('error', error); }
@@ -66,6 +71,28 @@ async function readActiveRow(context) {
   return info;
 }
 
+async function loadLogVocabulary(context, store) {
+  const sheet = context.workbook.worksheets.getItemOrNullObject(CONFIG.logSheet);
+  sheet.load('isNullObject'); await context.sync();
+  if (sheet.isNullObject) return;
+  const used = sheet.getUsedRangeOrNullObject(true);
+  used.load('isNullObject,rowIndex,rowCount,columnCount'); await context.sync();
+  if (used.isNullObject || used.rowCount <= 1) return;
+  const range = sheet.getRangeByIndexes(1, 0, used.rowCount - 1, Math.min(used.columnCount, LOG_HEADERS.length));
+  range.load('values'); await context.sync();
+  for (const row of range.values) {
+    const colName = tidy(row[5]), oldVal = tidy(row[6]), newVal = tidy(row[7]);
+    const l1 = tidy(row[8]), l2 = tidy(row[9]), l3 = tidy(row[10]), nm = tidy(row[11]);
+    if (colName === FIELD_LABELS.spesifikasi) {
+      if (oldVal) recordVocabulary(store, { spesifikasi: oldVal, level1: l1, level2: l2, level3: l3, nama: nm });
+      if (newVal) recordVocabulary(store, { spesifikasi: newVal, level1: l1, level2: l2, level3: l3, nama: nm });
+    } else if (colName === FIELD_LABELS.nama) {
+      if (oldVal) recordVocabulary(store, { nama: oldVal, level1: l1, level2: l2, level3: l3 });
+      if (newVal) recordVocabulary(store, { nama: newVal, level1: l1, level2: l2, level3: l3 });
+    }
+  }
+}
+
 /** Membaca kolom-kolom yang dikoreksi untuk seluruh baris data. */
 async function readIndex(context, sheet, layout, lastRow) {
   const first = layout.headerRow + 1, count = lastRow - layout.headerRow;
@@ -79,7 +106,10 @@ async function readIndex(context, sheet, layout, lastRow) {
     const item = { row: first + i };
     let any = false;
     for (const f of COPY_FIELDS) { item[f] = f in ranges ? tidy(ranges[f].values[i][0]) : ''; if (item[f]) any = true; }
-    if (any) rows.push(item);
+    if (any) {
+      rows.push(item);
+      recordVocabulary(state.vocabulary, item);
+    }
   }
   return rows;
 }
@@ -189,7 +219,7 @@ const level3Combo = createCombo({
 function freeCombo(field, prefix) {
   return createCombo({
     input: $(`${prefix}-input`), toggle: $(`${prefix}-toggle`), list: $(`${prefix}-list`),
-    getOptions: (text, browse) => (state.draft ? valueOptions(state.index || [], field, state.draft, text, browse, CONFIG.optionLimit) : []),
+    getOptions: (text, browse) => (state.draft ? valueOptions(state.index || [], field, state.draft, text, browse, state.vocabulary, CONFIG.optionLimit) : []),
     onPick(value) { state.draft[field] = value; syncInputs(); renderEdit(); },
     onCommit() {}
   });
@@ -311,9 +341,14 @@ async function saveCorrection() {
   if (!changes.length) throw new Error('Tidak ada perubahan untuk disimpan.');
   const problem = pathProblem(draft, state.master);
   if (problem) throw new Error(problem);
-  const move = $('move-row').checked, noteText = $('note').value;
+  const followMoved = $('follow-moved').checked;
+  const autoNextInvalid = $('auto-next-invalid').checked;
+  const noteText = $('note').value;
   const target = { sheetId: state.sheetId, rowIndex: state.rowIndex };
   const order = state.order;
+
+  recordVocabulary(state.vocabulary, orig);
+  recordVocabulary(state.vocabulary, draft);
 
   const result = await Excel.run(async context => {
     const active = await readActiveRow(context);
@@ -334,22 +369,20 @@ async function saveCorrection() {
     await context.sync();
 
     let finalRow = row, moved = false;
-    if (move) {
-      const rows = await readIndex(context, sheet, layout, active.lastRow);
-      const self = { row };
-      const others = rows.filter(r => r.row !== row);
-      const insertBefore = computeMoveTarget(others, self, orig, draft, order);
-      if (insertBefore !== null) {
-        const width = Math.max(layout.lastUsed, noteCol) + 1;
-        sheet.getRangeByIndexes(insertBefore, 0, 1, 1).getEntireRow().insert(Excel.InsertShiftDirection.down);
-        await context.sync();
-        const srcIndex = row >= insertBefore ? row + 1 : row;
-        sheet.getRangeByIndexes(insertBefore, 0, 1, width).copyFrom(sheet.getRangeByIndexes(srcIndex, 0, 1, width), Excel.RangeCopyType.all);
-        await context.sync();
-        sheet.getRangeByIndexes(srcIndex, 0, 1, 1).getEntireRow().delete(Excel.DeleteShiftDirection.up);
-        await context.sync();
-        finalRow = finalRowAfterMove(row, insertBefore); moved = true;
-      }
+    const rows = await readIndex(context, sheet, layout, active.lastRow);
+    const self = { row };
+    const others = rows.filter(r => r.row !== row);
+    const insertBefore = computeMoveTarget(others, self, orig, draft, order);
+    if (insertBefore !== null) {
+      const width = Math.max(layout.lastUsed, noteCol) + 1;
+      sheet.getRangeByIndexes(insertBefore, 0, 1, 1).getEntireRow().insert(Excel.InsertShiftDirection.down);
+      await context.sync();
+      const srcIndex = row >= insertBefore ? row + 1 : row;
+      sheet.getRangeByIndexes(insertBefore, 0, 1, width).copyFrom(sheet.getRangeByIndexes(srcIndex, 0, 1, width), Excel.RangeCopyType.all);
+      await context.sync();
+      sheet.getRangeByIndexes(srcIndex, 0, 1, 1).getEntireRow().delete(Excel.DeleteShiftDirection.up);
+      await context.sync();
+      finalRow = finalRowAfterMove(row, insertBefore); moved = true;
     }
 
     const base = { ...logBase(active.sheetName, draft, noteText), rowFrom: row + 1, rowTo: finalRow + 1 };
@@ -357,14 +390,17 @@ async function saveCorrection() {
     if (moved) entries.push({ ...base, action: 'Pindah baris', column: '-', old: `Baris ${row + 1}`, new: `Baris ${finalRow + 1}` });
     await appendLog(context, entries);
 
-    sheet.getCell(finalRow, layout.cols.nama).select();
+    // Navigasi fokus: jika followMoved dicentang, ikuti baris yang berpindah.
+    // Jika tidak dicentang, tetap berada di baris kerja semula (row) untuk melanjutkan tinjauan.
+    const targetSelectRow = (moved && followMoved) ? finalRow : Math.min(row, active.lastRow);
+    sheet.getCell(targetSelectRow, layout.cols.nama).select();
     await context.sync();
-    return { finalRow, moved };
+    return { finalRow, moved, targetSelectRow };
   });
   state.index = null; state.rowKey = '';
   await refresh();
   tell(result.moved ? `Tersimpan. Baris dipindah ke baris ${result.finalRow + 1} (kelompok yang benar).` : `Tersimpan di baris ${result.finalRow + 1}.`);
-  if ($('auto-next').checked) await jumpToInvalid();
+  if (autoNextInvalid) await jumpToInvalid();
 }
 
 async function markValid() {
@@ -382,7 +418,7 @@ async function markValid() {
     await appendLog(context, [{ ...logBase(active.sheetName, fields, noteText), rowFrom: target.rowIndex + 1, rowTo: target.rowIndex + 1, action: 'Valid', column: '-', old: '', new: '' }]);
   });
   tell(`Baris ${target.rowIndex + 1} ditandai valid (tercatat di sheet Log).`);
-  if ($('auto-next').checked) await jumpToInvalid(); else await go(Math.min(target.rowIndex + 1, state.lastRow));
+  if ($('auto-next-invalid').checked) await jumpToInvalid(); else await go(Math.min(target.rowIndex + 1, state.lastRow));
 }
 
 async function writeNote(p) {
@@ -432,8 +468,11 @@ async function jumpToInvalid() {
 }
 
 async function reload() {
-  state.master = await Excel.run(readMaster);
-  state.order = masterOrder(state.master);
+  await Excel.run(async context => {
+    state.master = await readMaster(context);
+    state.order = masterOrder(state.master);
+    await loadLogVocabulary(context, state.vocabulary);
+  });
   state.index = null; state.rowKey = '';
   await refresh();
   tell(`Master_Level dimuat (${state.master.paths.length} baris).`);

@@ -275,29 +275,87 @@ export function computeMoveTarget(rows, self, orig, updated, order) {
 /** Nomor baris akhir setelah baris dipindah dari `from` ke posisi sebelum `insertBefore`. */
 export const finalRowAfterMove = (from, insertBefore) => (from < insertBefore ? insertBefore - 1 : insertBefore);
 
-/** Pilihan isian bebas (Nama / Spesifikasi) dari nilai yang sudah ada di sheet. */
-export function valueOptions(rows, field, draft, text, browse, limit = 60) {
-  const l3 = keyOf(draft.level3), nm = keyOf(draft.nama);
+/**
+ * Menyimpan kamus nilai (Nama Produk dan Spesifikasi) yang pernah ada,
+ * sehingga jika suatu nilai diubah atau dipindah kelompoknya,
+ * nilai tersebut tidak hilang dari pilihan autocomplete/dropdown.
+ */
+export function createVocabularyStore() {
+  return {
+    nama: new Map(),        // keyOf(val) -> { label, level1, level2, level3 }
+    spesifikasi: new Map() // keyOf(val) -> { label, level1, level2, level3, nama }
+  };
+}
+
+export function recordVocabulary(store, item) {
+  if (!store || !item) return;
+  if (item.nama) {
+    const k = keyOf(item.nama);
+    if (!store.nama.has(k)) {
+      store.nama.set(k, { label: tidy(item.nama), level1: tidy(item.level1), level2: tidy(item.level2), level3: tidy(item.level3) });
+    }
+  }
+  if (item.spesifikasi) {
+    const k = keyOf(item.spesifikasi);
+    if (!store.spesifikasi.has(k)) {
+      store.spesifikasi.set(k, { label: tidy(item.spesifikasi), level1: tidy(item.level1), level2: tidy(item.level2), level3: tidy(item.level3), nama: tidy(item.nama) });
+    }
+  }
+}
+
+/** Pilihan isian bebas (Nama / Spesifikasi) dengan preservasi nilai riwayat agar tidak hilang. */
+export function valueOptions(rows, field, draft, text, browse, store, limit = 60) {
+  const l1 = keyOf(draft.level1), l2 = keyOf(draft.level2), l3 = keyOf(draft.level3), nm = keyOf(draft.nama);
   const counts = new Map();
+
+  // 1. Hitung frekuensi dari baris-baris fisik yang saat ini ada di sheet
   for (const r of rows) {
     const value = r[field];
     if (!value) continue;
     const k = keyOf(value);
     let e = counts.get(k);
-    if (!e) { e = { label: value, n: 0, rank: 2 }; counts.set(k, e); }
+    if (!e) { e = { label: value, n: 0, rank: 3, isHistorical: false }; counts.set(k, e); }
     e.n++;
     const inL3 = keyOf(r.level3) === l3;
-    const rank = field === 'nama' ? (inL3 ? 0 : 2) : (inL3 && keyOf(r.nama) === nm ? 0 : inL3 ? 1 : 2);
+    const rank = field === 'nama'
+      ? (inL3 ? 0 : keyOf(r.level2) === l2 ? 1 : 2)
+      : (inL3 && keyOf(r.nama) === nm ? 0 : inL3 ? 1 : keyOf(r.level2) === l2 ? 2 : 3);
     if (rank < e.rank) e.rank = rank;
   }
+
+  // 2. Gabungkan nilai-nilai dari kamus historis (store) yang mungkin sudah tidak ada lagi baris fisiknya di sheet
+  if (store && store[field]) {
+    for (const [k, saved] of store[field].entries()) {
+      if (!counts.has(k)) {
+        const inL3 = keyOf(saved.level3) === l3;
+        const rank = field === 'nama'
+          ? (inL3 ? 0 : keyOf(saved.level2) === l2 ? 1 : 2)
+          : (inL3 && keyOf(saved.nama) === nm ? 0 : inL3 ? 1 : keyOf(saved.level2) === l2 ? 2 : 3);
+        counts.set(k, { label: saved.label, n: 0, rank, isHistorical: true });
+      }
+    }
+  }
+
   let list = [...counts.values()];
   const q = keyOf(text);
   if (browse || !q) {
     const best = list.filter(e => e.rank === 0);
     list = best.length ? best : list.filter(e => e.rank < 2).length ? list.filter(e => e.rank < 2) : list;
-  } else list = list.filter(e => keyOf(e.label).includes(q));
+  } else {
+    list = list.filter(e => keyOf(e.label).includes(q));
+  }
+
   list.sort((a, b) => a.rank - b.rank || b.n - a.n || a.label.localeCompare(b.label, 'id'));
-  return list.slice(0, limit).map(e => ({ label: e.label, sub: `${e.n} baris${e.rank === 0 ? ' · kelompok sama' : ''}`, data: e.label }));
+
+  return list.slice(0, limit).map(e => {
+    let sub = '';
+    if (e.isHistorical) {
+      sub = e.rank === 0 ? 'riwayat · kelompok sama' : 'riwayat katalog';
+    } else {
+      sub = `${e.n} baris${e.rank === 0 ? ' · kelompok sama' : ''}`;
+    }
+    return { label: e.label, sub, data: e.label };
+  });
 }
 
 export function formatTime(date = new Date()) {

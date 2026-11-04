@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  checkClassification, computeMoveTarget, detectLayout, diffFields, finalRowAfterMove, findLevel2, level1List, level2Entries,
-  masterOrder, parseMaster, pathProblem, planCorrectionColumns, safeText, suggest, valueOptions
+  checkClassification, computeMoveTarget, createVocabularyStore, detectLayout, diffFields, finalRowAfterMove, findLevel2, level1List, level2Entries,
+  masterOrder, parseMaster, pathProblem, planCorrectionColumns, recordVocabulary, safeText, suggest, valueOptions
 } from '../public/core.js';
 
 const masterRows = [
@@ -93,6 +93,30 @@ test('valueOptions memprioritaskan kelompok yang sama', () => {
   assert.deepEqual(valueOptions(rows, 'nama', draft, '', true).map(o => o.label), ['Semen']);
   assert.deepEqual(valueOptions(rows, 'nama', draft, 'bet', false).map(o => o.label), ['Beton']);
   assert.equal(valueOptions(rows, 'spesifikasi', draft, '', true)[0].label, 'OPC');
+});
+
+test('valueOptions preservasi: spesifikasi tunggal (OPC) yang diubah ke PCC tetap muncul di saran', () => {
+  const store = createVocabularyStore();
+  // Baris fisik awal: ada OPC (1 baris saja)
+  recordVocabulary(store, { level1: 'Supplier', level2: S, level3: 'Semen', nama: 'Semen', spesifikasi: 'OPC; Indonesia Tipe; Tipe OPC' });
+
+  // Setelah baris diubah ke PCC; Curah, di rows fisik saat ini SUDAH TIDAK ADA OPC
+  const currentRows = [
+    { level1: 'Supplier', level2: S, level3: 'Semen', nama: 'Semen', spesifikasi: 'PCC; Curah' },
+    { level1: 'Supplier', level2: S, level3: 'Semen', nama: 'Semen', spesifikasi: 'PCC; Curah' }
+  ];
+  const draft = { level1: 'Supplier', level2: S, level3: 'Semen', nama: 'Semen' };
+
+  const options = valueOptions(currentRows, 'spesifikasi', draft, '', true, store);
+  const labels = options.map(o => o.label);
+
+  // PCC; Curah ada dari baris fisik
+  assert.equal(labels.includes('PCC; Curah'), true);
+  // OPC yang baris fisiknya sudah 0 TETAP ADA dari kamus riwayat!
+  assert.equal(labels.includes('OPC; Indonesia Tipe; Tipe OPC'), true);
+
+  const opcItem = options.find(o => o.label === 'OPC; Indonesia Tipe; Tipe OPC');
+  assert.equal(opcItem.sub.includes('riwayat'), true);
 });
 
 test('suggest dan safeText', () => {
