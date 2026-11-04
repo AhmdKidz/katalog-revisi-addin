@@ -342,7 +342,6 @@ async function saveCorrection() {
   const problem = pathProblem(draft, state.master);
   if (problem) throw new Error(problem);
   const followMoved = $('follow-moved').checked;
-  const autoNextInvalid = $('auto-next-invalid').checked;
   const noteText = $('note').value;
   const target = { sheetId: state.sheetId, rowIndex: state.rowIndex };
   const order = state.order;
@@ -400,7 +399,6 @@ async function saveCorrection() {
   state.index = null; state.rowKey = '';
   await refresh();
   tell(result.moved ? `Tersimpan. Baris dipindah ke baris ${result.finalRow + 1} (kelompok yang benar).` : `Tersimpan di baris ${result.finalRow + 1}.`);
-  if (autoNextInvalid) await jumpToInvalid();
 }
 
 async function markValid() {
@@ -418,7 +416,7 @@ async function markValid() {
     await appendLog(context, [{ ...logBase(active.sheetName, fields, noteText), rowFrom: target.rowIndex + 1, rowTo: target.rowIndex + 1, action: 'Valid', column: '-', old: '', new: '' }]);
   });
   tell(`Baris ${target.rowIndex + 1} ditandai valid (tercatat di sheet Log).`);
-  if ($('auto-next-invalid').checked) await jumpToInvalid(); else await go(Math.min(target.rowIndex + 1, state.lastRow));
+  await go(Math.min(target.rowIndex + 1, state.lastRow));
 }
 
 async function writeNote(p) {
