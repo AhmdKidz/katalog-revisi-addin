@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+*.pem
+*.key
+*.crt
+.env
+.dev.vars
+.wrangler/

@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Koreksi Klasifikasi Katalog</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header><h1>Koreksi Klasifikasi</h1><p>Katalog Sumber Daya · v1.0</p></header>
+  <main>
+    <p id="connection" role="status">Buka panel ini melalui Add-ins di Excel.</p>
+    <p id="message" role="status" aria-live="polite"></p>
+
+    <section class="toolbar">
+      <button id="reload" type="button">Muat ulang master</button>
+      <span id="count"></span>
+    </section>
+
+    <section id="setup" hidden>
+      <p id="setup-text"></p>
+      <button id="prepare" type="button" class="primary">Siapkan kolom koreksi</button>
+    </section>
+
+    <section id="row-card" hidden>
+      <div class="card">
+        <div class="row-head"><strong id="row-address">Baris -</strong><span id="row-status" class="badge"></span></div>
+        <dl>
+          <dt>Nama produk / pekerjaan</dt><dd id="r-nama"></dd>
+          <dt>Spesifikasi</dt><dd id="r-spek"></dd>
+          <dt>Satuan · Merek</dt><dd id="r-misc"></dd>
+        </dl>
+      </div>
+
+      <div class="card">
+        <h2>Klasifikasi saat ini</h2>
+        <ul class="path"><li id="c-l1"></li><li id="c-l2"></li><li id="c-l3"></li></ul>
+        <p id="check" class="check"></p>
+        <p id="existing" class="secondary"></p>
+      </div>
+
+      <div class="card" id="suggest-card" hidden>
+        <h2>Saran dari nama produk</h2>
+        <div id="suggestions"></div>
+      </div>
+
+      <div class="card">
+        <h2>Koreksi</h2>
+        <label for="level3-search">Cari Level 3 yang benar</label>
+        <input id="level3-search" type="text" autocomplete="off" placeholder="Ketik nama Level 3 / Level 2">
+        <div id="results" class="results" role="listbox" aria-label="Hasil pencarian Level 3"></div>
+        <div id="picked" class="picked" hidden></div>
+
+        <label for="level-target">Nama produk/pekerjaan ini seharusnya berada di</label>
+        <select id="level-target"></select>
+
+        <label for="note">Catatan</label>
+        <textarea id="note" rows="2" placeholder="Opsional. Mis. 'Merek ikut terbawa di nama produk'"></textarea>
+
+        <div class="actions">
+          <button id="save-corrected" type="button" class="primary">Simpan koreksi</button>
+          <button id="save-valid" type="button">Tandai valid</button>
+          <button id="save-review" type="button">Perlu review</button>
+        </div>
+        <label class="inline"><input id="auto-next" type="checkbox" checked> Setelah menyimpan, pindah ke baris berikutnya yang belum ditinjau</label>
+      </div>
+
+      <div class="nav">
+        <button id="prev" type="button">◀ Baris sebelumnya</button>
+        <button id="next" type="button">Berikutnya ▶</button>
+        <button id="next-pending" type="button">Belum ditinjau ⏭</button>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
