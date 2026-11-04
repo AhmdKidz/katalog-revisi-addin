@@ -1,78 +1,94 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildCorrection, checkClassification, detectLayout, nextPending, parseMaster, planCorrectionColumns, safeText, suggest } from '../public/core.js';
+import {
+  checkClassification, computeMoveTarget, detectLayout, diffFields, finalRowAfterMove, findLevel2, level1List, level2Entries,
+  masterOrder, parseMaster, pathProblem, planCorrectionColumns, safeText, suggest, valueOptions
+} from '../public/core.js';
 
 const masterRows = [
   ['Level 1', 'Kode Level 2', 'Level 2', 'Level 3', 'Inisial'],
   ['Supplier', 'SUP-01', 'Material Semen, Beton & Grout', 'Semen', ''],
   ['', '', '', 'Ready Mix', ''],
-  ['Supplier', 'SUP-02', 'Baja & Besi', 'Besi Beton', '']
+  ['Supplier', 'SUP-02', 'Baja & Besi', 'Besi Beton', ''],
+  ['Supplier', 'SUP-05', 'Produk Beton Pracetak & Prategang', 'Tiang Pancang', '']
 ];
+const master = parseMaster(masterRows);
 
 test('parseMaster mengisi induk yang kosong', () => {
-  const m = parseMaster(masterRows);
-  assert.equal(m.paths.length, 3);
-  assert.equal(m.byLevel3.get('ready mix')[0].level2, 'Material Semen, Beton & Grout');
-  assert.equal(m.byLevel3.get('ready mix')[0].kode2, 'SUP-01');
+  assert.equal(master.paths.length, 4);
+  assert.equal(master.byLevel3.get('ready mix')[0].kode2, 'SUP-01');
+  assert.deepEqual(level1List(master), ['Supplier']);
+  assert.equal(level2Entries(master).length, 3);
+  assert.equal(findLevel2(master, 'Supplier', 'Baja & Besi').kode2, 'SUP-02');
 });
 
-test('checkClassification: sesuai, induk salah, tidak ada, kosong', () => {
-  const m = parseMaster(masterRows);
-  assert.equal(checkClassification({ level1: 'Supplier', level2: 'Material Semen, Beton & Grout', level3: 'Semen' }, m).ok, true);
-  assert.equal(checkClassification({ level1: 'Supplier', level2: 'Baja & Besi', level3: 'Semen' }, m).code, 'induk-salah');
-  assert.equal(checkClassification({ level1: 'Supplier', level2: 'x', level3: 'Pasir' }, m).code, 'l3-tidak-ada');
-  assert.equal(checkClassification({}, m).code, 'kosong');
+test('checkClassification dan pathProblem', () => {
+  assert.equal(checkClassification({ level1: 'Supplier', level2: 'Material Semen, Beton & Grout', level3: 'Semen' }, master).ok, true);
+  assert.equal(checkClassification({ level1: 'Supplier', level2: 'Baja & Besi', level3: 'Semen' }, master).code, 'induk-salah');
+  assert.equal(pathProblem({ level1: 'Supplier', level2: 'Baja & Besi', level3: '' }, master).includes('Level 3'), true);
+  assert.equal(pathProblem({ level1: 'Supplier', level2: 'Baja & Besi', level3: 'Semen' }, master).includes('tidak ada'), true);
+  assert.equal(pathProblem({ level1: 'Supplier', level2: 'Baja & Besi', level3: 'Besi Beton' }, master), '');
 });
 
-test('detectLayout pada format DG (judul baris 1)', () => {
-  const rows = [['Tanggal', 'Level 1', 'Kode Level 2', 'Level 2', 'Level 3', 'Nama Produk / Pekerjaan', 'Spesifikasi', 'Satuan', 'Merek', 'Tahun Sumber']];
-  const l = detectLayout(rows);
-  assert.equal(l.headerRow, 0);
-  assert.equal(l.cols.nama, 5);
-  assert.equal(l.cols.level3, 4);
-  assert.equal(l.lastUsed, 9);
-  assert.equal(l.hasAllCorrection, false);
-  const { plan, created } = planCorrectionColumns(l);
-  assert.equal(plan.status, 10);
-  assert.equal(created.length, 7);
-});
-
-test('detectLayout pada format DSU rapih (judul baris 3, banyak kolom)', () => {
-  const rows = [[], [], ['Nama Vendor', 'Tanggal', 'Level 1', 'Kode Level 2', 'Level 2', 'Level 3', 'Nama produk / pekerjaan', 'Level 4: Spesifikasi teknis', 'Level 5: Satuan', 'Level 6: Merek 1']];
-  const l = detectLayout(rows);
-  assert.equal(l.headerRow, 2);
-  assert.equal(l.cols.spesifikasi, 7);
-  assert.equal(l.cols.satuan, 8);
-  assert.equal(l.cols.merek, 9);
-});
-
-test('detectLayout mengenali kolom koreksi yang sudah ada', () => {
-  const headers = ['Level 1', 'Level 2', 'Level 3', 'Nama Produk', 'Koreksi: Status', 'Koreksi: Catatan'];
-  const l = detectLayout([headers]);
-  assert.equal(l.correction.status, 4);
-  assert.equal(l.lastCol, 3);
-  const { plan, created } = planCorrectionColumns(l);
-  assert.equal(plan.status, 4);
-  assert.equal(plan.levelTarget, 6);
-  assert.equal(created.includes('status'), false);
-});
-
-test('detectLayout null bila judul wajib tidak ada', () => {
+test('detectLayout DG, DSU, dan kolom catatan', () => {
+  const dg = detectLayout([['Tanggal', 'Level 1', 'Kode Level 2', 'Level 2', 'Level 3', 'Nama Produk / Pekerjaan', 'Spesifikasi', 'Satuan', 'Merek', 'Tahun Sumber']]);
+  assert.equal(dg.headerRow, 0); assert.equal(dg.cols.kode2, 2); assert.equal(dg.lastUsed, 9);
+  const { plan, created } = planCorrectionColumns(dg);
+  assert.deepEqual(created, ['note']); assert.equal(plan.note, 10);
+  const dsu = detectLayout([[], [], ['Nama Vendor', 'Tanggal', 'Level 1', 'Kode Level 2', 'Level 2', 'Level 3', 'Nama produk / pekerjaan', 'Level 4: Spesifikasi teknis', 'Level 5: Satuan', 'Level 6: Merek 1', 'Catatan Koreksi']]);
+  assert.equal(dsu.headerRow, 2); assert.equal(dsu.cols.spesifikasi, 7); assert.equal(dsu.correction.note, 10); assert.equal(dsu.hasAllCorrection, true);
+  assert.equal(dsu.lastCol, 9);
   assert.equal(detectLayout([['A', 'B']]), null);
 });
 
-test('suggest memberi Level 3 yang cocok dengan nama produk', () => {
-  const m = parseMaster(masterRows);
-  const s = suggest('Semen Portland Tipe 1', 'Kemasan 40 kg', m);
-  assert.equal(s[0].label, 'Semen');
+test('diffFields hanya melaporkan kolom yang berubah', () => {
+  const o = { level1: 'Supplier', kode2: 'SUP-05', level2: 'Produk Beton', level3: 'Tiang', nama: 'A', spesifikasi: 'x' };
+  const d = { ...o, level2: 'Semen', kode2: 'SUP-01' };
+  assert.deepEqual(diffFields(o, d).map(c => c.field), ['kode2', 'level2']);
+  assert.deepEqual(diffFields(o, o), []);
 });
 
-test('safeText, buildCorrection, nextPending', () => {
+// Baris data mulai indeks 1 (judul di indeks 0).
+const R = (row, level2, level3, nama) => ({ row, level1: 'Supplier', level2, level3, nama });
+const S = 'Material Semen, Beton & Grout', B = 'Baja & Besi', P = 'Produk Beton Pracetak & Prategang';
+const order = masterOrder(master);
+
+test('computeMoveTarget: pindah ke kelompok Level 3 yang sama (setelah nama sama)', () => {
+  const rows = [R(1, S, 'Semen', 'Semen'), R(2, S, 'Semen', 'Semen'), R(3, S, 'Ready Mix', 'Beton'), R(4, B, 'Besi Beton', 'Besi 10'), R(6, P, 'Tiang Pancang', 'Tiang')];
+  const orig = { level1: 'Supplier', level2: P, level3: 'Tiang Pancang', nama: 'Semen' };
+  const upd = { level1: 'Supplier', level2: S, level3: 'Semen', nama: 'Semen' };
+  const target = computeMoveTarget(rows, { row: 5 }, orig, upd, order);
+  assert.equal(target, 3);
+  assert.equal(finalRowAfterMove(5, 3), 3);
+});
+
+test('computeMoveTarget: Level 3 baru di Level 2 yang sama mengikuti urutan master', () => {
+  const rows = [R(1, S, 'Semen', 'Semen'), R(2, S, 'Semen', 'Semen'), R(3, B, 'Besi Beton', 'Besi'), R(5, P, 'Tiang Pancang', 'Tiang')];
+  const orig = { level1: 'Supplier', level2: P, level3: 'Tiang Pancang', nama: 'Beton' };
+  const upd = { level1: 'Supplier', level2: S, level3: 'Ready Mix', nama: 'Beton' };
+  assert.equal(computeMoveTarget(rows, { row: 4 }, orig, upd, order), 3); // setelah baris Semen terakhir (2)
+});
+
+test('computeMoveTarget: tidak pindah bila kelompok & nama sama, atau sudah di posisi benar', () => {
+  const rows = [R(1, S, 'Semen', 'Semen'), R(3, S, 'Semen', 'Semen')];
+  const o = { level1: 'Supplier', level2: S, level3: 'Semen', nama: 'Semen' };
+  assert.equal(computeMoveTarget(rows, { row: 2 }, o, { ...o }, order), null);
+  const orig = { ...o, nama: 'Lain' };
+  assert.equal(computeMoveTarget([R(1, S, 'Semen', 'Semen')], { row: 2 }, orig, o, order), null); // sudah tepat setelah baris 1
+});
+
+test('valueOptions memprioritaskan kelompok yang sama', () => {
+  const rows = [
+    { level3: 'Semen', nama: 'Semen', spesifikasi: 'OPC' }, { level3: 'Semen', nama: 'Semen', spesifikasi: 'OPC' },
+    { level3: 'Ready Mix', nama: 'Beton', spesifikasi: 'fc 30' }
+  ];
+  const draft = { level3: 'Semen', nama: 'Semen' };
+  assert.deepEqual(valueOptions(rows, 'nama', draft, '', true).map(o => o.label), ['Semen']);
+  assert.deepEqual(valueOptions(rows, 'nama', draft, 'bet', false).map(o => o.label), ['Beton']);
+  assert.equal(valueOptions(rows, 'spesifikasi', draft, '', true)[0].label, 'OPC');
+});
+
+test('suggest dan safeText', () => {
+  assert.equal(suggest('Semen Portland Tipe 1', 'Kemasan 40 kg', master)[0].label, 'Semen');
   assert.equal(safeText('=1+1'), "'=1+1");
-  assert.equal(safeText('aman'), 'aman');
-  const c = buildCorrection({ status: 'Dikoreksi', levelTarget: 'Level 3', path: { level1: 'A', kode2: 'K', level2: 'B', level3: 'C' }, note: '  hai   ' });
-  assert.equal(c.note, 'hai');
-  assert.equal(c.level3, 'C');
-  assert.equal(nextPending(['Valid', 'Dikoreksi', '', 'Valid'], -1), 2);
-  assert.equal(nextPending(['Valid'], -1), -1);
 });

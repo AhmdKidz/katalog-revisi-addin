@@ -1,15 +1,20 @@
 /* global Office, Excel */
-import { CONFIG, CORRECTION_HEADERS, LEVEL_TARGETS, STATUS } from './config.js';
-import { buildCorrection, checkClassification, detectLayout, filterPaths, keyOf, nextPending, parseMaster, planCorrectionColumns, safeText, suggest, tidy } from './core.js';
+import { CONFIG, CORRECTION_HEADERS, FIELD_LABELS, LOG_HEADERS } from './config.js';
+import { createCombo } from './combobox.js';
+import {
+  checkClassification, computeMoveTarget, detectLayout, diffFields, filterPaths, finalRowAfterMove, findLevel2, findPath, formatTime,
+  keyOf, level1List, level2Entries, masterOrder, parseMaster, pathProblem, planCorrectionColumns, safeText, suggest, tidy, valueOptions
+} from './core.js';
 
 const $ = id => document.getElementById(id);
-const state = { master: null, layout: null, sheetId: null, sheetName: '', lastRow: 0, rowIndex: -1, row: null, picked: null, rowKey: '', busy: false };
-let queue = Promise.resolve(), selectionTimer;
+const COPY_FIELDS = ['level1', 'kode2', 'level2', 'level3', 'nama', 'spesifikasi'];
+const state = { master: null, order: null, layout: null, sheetId: null, sheetName: '', lastRow: 0, rowIndex: -1, row: null, multi: false, index: null, indexSheetId: null, orig: null, draft: null, rowKey: '', busy: false };
+let queue = Promise.resolve(), selectionTimer, noteTimer, pendingNote = null;
 
 function tell(text, error = false) { $('message').textContent = text; $('message').classList.toggle('error', error); }
 function failure(error) {
   const code = error?.code || '';
-  if (['AccessDenied', 'ProtectedRange', 'InvalidOperationInCellEditMode'].includes(code)) return 'Excel menolak perubahan. Pastikan sel dapat diedit dan Anda tidak sedang dalam mode mengetik di sel.';
+  if (['AccessDenied', 'ProtectedRange', 'InvalidOperationInCellEditMode'].includes(code)) return 'Excel menolak perubahan. Pastikan sel dapat diedit (sheet tidak diproteksi) dan Anda tidak sedang mengetik di sel.';
   return error?.message || 'Operasi Excel gagal. Coba lagi.';
 }
 function enqueue(work) {
@@ -20,6 +25,8 @@ function enqueue(work) {
   });
   return queue;
 }
+
+// ───────────── Pembacaan data Excel ─────────────
 
 async function readMaster(context) {
   const sheet = context.workbook.worksheets.getItemOrNullObject(CONFIG.masterSheet);
@@ -34,7 +41,13 @@ async function readMaster(context) {
   return parseMaster(data.values, CONFIG.headerSearchRows);
 }
 
-/** Membaca seleksi aktif, tata letak sheet, dan isi baris yang dipilih. */
+async function loadLayout(context, sheet) {
+  const head = sheet.getRangeByIndexes(0, 0, CONFIG.headerSearchRows, CONFIG.maxHeaderColumns);
+  head.load('values'); await context.sync();
+  return detectLayout(head.values, CONFIG.headerSearchRows);
+}
+
+/** Seleksi aktif + tata letak sheet + isi baris terpilih. */
 async function readActiveRow(context) {
   const range = context.workbook.getSelectedRange();
   const sheet = range.worksheet;
@@ -42,10 +55,8 @@ async function readActiveRow(context) {
   sheet.load('id,name');
   const used = sheet.getUsedRange(true);
   used.load('rowIndex,rowCount');
-  const head = sheet.getRangeByIndexes(0, 0, CONFIG.headerSearchRows, CONFIG.maxHeaderColumns);
-  head.load('values');
   await context.sync();
-  const layout = detectLayout(head.values, CONFIG.headerSearchRows);
+  const layout = await loadLayout(context, sheet);
   const info = { sheetId: sheet.id, sheetName: sheet.name, layout, lastRow: used.rowIndex + used.rowCount - 1, rowIndex: range.rowIndex, multi: range.rowCount > 1, row: null };
   if (!layout || range.rowIndex <= layout.headerRow) return info;
   const width = Math.max(layout.lastUsed, ...Object.values(layout.correction), 0) + 1;
@@ -55,210 +66,394 @@ async function readActiveRow(context) {
   return info;
 }
 
+/** Membaca kolom-kolom yang dikoreksi untuk seluruh baris data. */
+async function readIndex(context, sheet, layout, lastRow) {
+  const first = layout.headerRow + 1, count = lastRow - layout.headerRow;
+  if (count <= 0) return [];
+  const names = COPY_FIELDS.filter(f => f in layout.cols);
+  const ranges = Object.fromEntries(names.map(f => [f, sheet.getRangeByIndexes(first, layout.cols[f], count, 1)]));
+  for (const range of Object.values(ranges)) range.load('values');
+  await context.sync();
+  const rows = [];
+  for (let i = 0; i < count; i++) {
+    const item = { row: first + i };
+    let any = false;
+    for (const f of COPY_FIELDS) { item[f] = f in ranges ? tidy(ranges[f].values[i][0]) : ''; if (item[f]) any = true; }
+    if (any) rows.push(item);
+  }
+  return rows;
+}
+
+const fieldsOfRow = (row, layout) => Object.fromEntries(COPY_FIELDS.map(f => [f, f in layout.cols ? tidy(row[layout.cols[f]]) : '']));
+const cell = name => (state.row && state.layout && name in state.layout.cols ? tidy(state.row[state.layout.cols[name]]) : '');
+const noteOf = (row, layout) => (row && layout && 'note' in layout.correction ? tidy(row[layout.correction.note]) : '');
+
 async function refresh() {
-  const info = await Excel.run(readActiveRow);
-  const key = `${info.sheetId}:${info.rowIndex}`;
-  Object.assign(state, { layout: info.layout, sheetId: info.sheetId, sheetName: info.sheetName, lastRow: info.lastRow, rowIndex: info.rowIndex, row: info.row, multi: info.multi });
-  if (key !== state.rowKey) { // baris berbeda: reset formulir
-    state.rowKey = key; state.picked = null;
-    $('level3-search').value = ''; $('note').value = '';
-    $('level-target').value = LEVEL_TARGETS[0];
-    const existing = state.row && state.layout?.correction;
-    if (existing) {
-      const get = name => (name in state.layout.correction ? tidy(state.row[state.layout.correction[name]]) : '');
-      if (get('levelTarget')) $('level-target').value = get('levelTarget');
-      $('note').value = get('note');
+  const info = await Excel.run(async context => {
+    const base = await readActiveRow(context);
+    let index = null;
+    if (base.layout && base.row && (state.indexSheetId !== base.sheetId || !state.index)) {
+      index = await readIndex(context, context.workbook.worksheets.getItem(base.sheetId), base.layout, base.lastRow);
     }
+    return { ...base, index };
+  });
+  Object.assign(state, { layout: info.layout, sheetId: info.sheetId, sheetName: info.sheetName, lastRow: info.lastRow, rowIndex: info.rowIndex, row: info.row, multi: info.multi });
+  if (info.index) { state.index = info.index; state.indexSheetId = info.sheetId; }
+  const key = `${info.sheetId}:${info.rowIndex}`;
+  if (key !== state.rowKey) {
+    state.rowKey = key;
+    if (info.row) initDraft(); else { state.orig = null; state.draft = null; }
   }
 }
 
-const cell = (name) => (state.row && state.layout && name in state.layout.cols ? tidy(state.row[state.layout.cols[name]]) : '');
-const corrCell = (name) => (state.row && state.layout && name in state.layout.correction ? tidy(state.row[state.layout.correction[name]]) : '');
-
-function optionButton(path, onPick, extra) {
-  const b = document.createElement('button');
-  b.type = 'button'; b.className = 'opt';
-  b.textContent = path.level3;
-  const small = document.createElement('small');
-  small.textContent = `${path.level1} › ${path.level2}${extra ? ` · ${extra}` : ''}`;
-  b.append(small);
-  b.addEventListener('click', () => onPick(path));
-  return b;
+function initDraft() {
+  state.orig = fieldsOfRow(state.row, state.layout);
+  state.draft = { ...state.orig };
+  $('note').value = noteOf(state.row, state.layout);
+  syncInputs();
 }
 
-function pick(path) { state.picked = path; $('level-target').value = state.picked ? 'Level 3' : LEVEL_TARGETS[0]; render(); }
+// ───────────── Formulir koreksi ─────────────
+
+function syncInputs() {
+  const d = state.draft;
+  if (!d) return;
+  fill1();
+  $('level1').value = d.level1;
+  level2Combo.setText(d.level2); level3Combo.setText(d.level3); namaCombo.setText(d.nama); spekCombo.setText(d.spesifikasi);
+}
+function fill1() {
+  const select = $('level1');
+  const list = state.master ? level1List(state.master) : [];
+  const current = state.draft?.level1;
+  if (current && !list.some(v => keyOf(v) === keyOf(current))) list.push(current);
+  select.replaceChildren(new Option('(pilih Level 1)', ''));
+  for (const value of list) select.add(new Option(value, value));
+}
+
+function pickLevel2(entry) {
+  const d = state.draft;
+  d.level1 = entry.level1; d.level2 = entry.level2; d.kode2 = entry.kode2;
+  if (!findPath(state.master, d.level1, d.level2, d.level3)) d.level3 = '';
+  syncInputs(); renderEdit();
+}
+const level2Combo = createCombo({
+  input: $('level2-input'), toggle: $('level2-toggle'), list: $('level2-list'),
+  getOptions(text, browse) {
+    if (!state.master) return [];
+    const all = level2Entries(state.master), q = keyOf(text), d = state.draft;
+    let list = all;
+    if (browse || !q) list = all.filter(e => !d.level1 || keyOf(e.level1) === keyOf(d.level1));
+    else list = all.filter(e => keyOf(`${e.level2} ${e.kode2} ${e.level1}`).includes(q))
+      .sort((a, b) => Number(keyOf(b.level1) === keyOf(d.level1)) - Number(keyOf(a.level1) === keyOf(d.level1)));
+    return list.slice(0, CONFIG.optionLimit).map(e => ({ label: e.level2, sub: `${e.kode2 || '-'} · ${e.level1}`, data: e }));
+  },
+  onPick: pickLevel2,
+  onCommit(text) {
+    const d = state.draft; if (!d || !state.master) return;
+    const q = keyOf(text);
+    if (q === keyOf(d.level2)) { level2Combo.setText(d.level2); return; }
+    const matches = level2Entries(state.master).filter(e => keyOf(e.level2) === q);
+    const pick = matches.find(e => keyOf(e.level1) === keyOf(d.level1)) || (matches.length === 1 ? matches[0] : null);
+    if (pick) pickLevel2(pick);
+    level2Combo.setText(state.draft.level2);
+  }
+});
+
+function pickLevel3(path) {
+  const d = state.draft;
+  d.level1 = path.level1; d.level2 = path.level2; d.kode2 = path.kode2; d.level3 = path.level3;
+  syncInputs(); renderEdit();
+}
+const level3Combo = createCombo({
+  input: $('level3-input'), toggle: $('level3-toggle'), list: $('level3-list'),
+  getOptions(text, browse) {
+    if (!state.master) return [];
+    const d = state.draft, q = keyOf(text), all = state.master.paths;
+    let list;
+    if (browse || !q) list = all.filter(p => (!d.level1 || keyOf(p.level1) === keyOf(d.level1)) && (!d.level2 || keyOf(p.level2) === keyOf(d.level2)));
+    else list = filterPaths(state.master, text, 500).sort((a, b) => Number(keyOf(b.level2) === keyOf(d.level2)) - Number(keyOf(a.level2) === keyOf(d.level2)));
+    return list.slice(0, CONFIG.optionLimit).map(p => ({ label: p.level3, sub: `${p.level1} › ${p.level2}`, data: p }));
+  },
+  onPick: pickLevel3,
+  onCommit(text) {
+    const d = state.draft; if (!d || !state.master) return;
+    const q = keyOf(text);
+    if (q === keyOf(d.level3)) { level3Combo.setText(d.level3); return; }
+    const matches = state.master.byLevel3.get(q) || [];
+    const pick = matches.find(p => keyOf(p.level1) === keyOf(d.level1) && keyOf(p.level2) === keyOf(d.level2)) || (matches.length === 1 ? matches[0] : null);
+    if (pick) pickLevel3(pick); else level3Combo.setText(d.level3);
+  }
+});
+
+function freeCombo(field, prefix) {
+  return createCombo({
+    input: $(`${prefix}-input`), toggle: $(`${prefix}-toggle`), list: $(`${prefix}-list`),
+    getOptions: (text, browse) => (state.draft ? valueOptions(state.index || [], field, state.draft, text, browse, CONFIG.optionLimit) : []),
+    onPick(value) { state.draft[field] = value; syncInputs(); renderEdit(); },
+    onCommit() {}
+  });
+}
+const namaCombo = freeCombo('nama', 'nama');
+const spekCombo = freeCombo('spesifikasi', 'spek');
+$('nama-input').addEventListener('input', () => { if (state.draft) { state.draft.nama = $('nama-input').value; renderEdit(); } });
+$('spek-input').addEventListener('input', () => { if (state.draft) { state.draft.spesifikasi = $('spek-input').value; renderEdit(); } });
+
+$('level1').addEventListener('change', () => {
+  const d = state.draft; if (!d || !state.master) return;
+  d.level1 = $('level1').value;
+  const l2 = d.level1 && d.level2 ? findLevel2(state.master, d.level1, d.level2) : null;
+  if (l2) d.kode2 = l2.kode2; else { d.level2 = ''; d.kode2 = ''; }
+  if (!findPath(state.master, d.level1, d.level2, d.level3)) d.level3 = '';
+  syncInputs(); renderEdit();
+});
+
+function currentProblem() {
+  if (!state.draft || !state.master) return '';
+  return pathProblem(state.draft, state.master);
+}
+
+function renderEdit() {
+  const d = state.draft;
+  if (!d) return;
+  $('kode2').textContent = d.kode2 ? `(Kode ${d.kode2}, otomatis)` : '';
+  const changes = diffFields(state.orig, d);
+  const box = $('changes'); box.replaceChildren(); box.hidden = !changes.length;
+  for (const c of changes) {
+    const line = document.createElement('div');
+    line.textContent = `${FIELD_LABELS[c.field]}: ${c.old || '(kosong)'} → ${c.new || '(kosong)'}`;
+    box.append(line);
+  }
+  const problem = changes.length ? currentProblem() : '';
+  $('problem').textContent = problem; $('problem').hidden = !problem;
+  $('save').disabled = state.busy || !changes.length || Boolean(problem);
+  $('reset').disabled = state.busy || !changes.length;
+}
 
 function render() {
   const ready = Boolean(state.master);
   $('count').textContent = ready ? `${state.master.paths.length} baris master` : '';
   $('reload').disabled = state.busy;
-  const layout = state.layout;
-  const rowOk = Boolean(layout && state.row);
-  const needsSetup = Boolean(layout && !layout.hasAllCorrection);
-  if (!layout) {
-    $('setup').hidden = false; $('prepare').hidden = true;
-    $('setup-text').textContent = `Sheet "${state.sheetName || 'aktif'}" tidak dikenali sebagai tabel katalog. Pastikan baris judul memuat Level 1, Level 2, Level 3, dan Nama Produk / Pekerjaan, lalu pilih sebuah sel di sheet tersebut.`;
-  } else if (needsSetup) {
-    $('setup').hidden = false; $('prepare').hidden = false;
-    $('setup-text').textContent = `Kolom koreksi belum lengkap di sheet "${state.sheetName}". Tombol di bawah menambahkan judul yang kurang di sisi kanan tabel (data asli tidak diubah).`;
-  } else $('setup').hidden = true;
-
+  const layout = state.layout, rowOk = Boolean(layout && state.row && state.draft);
+  $('setup').hidden = Boolean(layout);
+  if (!layout) $('setup-text').textContent = `Sheet "${state.sheetName || 'aktif'}" tidak dikenali sebagai tabel katalog. Pastikan baris judul memuat Level 1, Level 2, Level 3, dan Nama Produk / Pekerjaan, lalu pilih sebuah sel di sheet tersebut.`;
   $('row-card').hidden = !rowOk;
-  if (!rowOk) {
-    if (layout && state.multi) tell('Pilih satu baris data saja.', true);
-    return;
-  }
-  const rowNumber = state.rowIndex + 1;
-  $('row-address').textContent = `${state.sheetName} · baris ${rowNumber}`;
+  if (!rowOk) { if (layout && state.multi) tell('Pilih satu baris data saja.', true); return; }
+
+  $('row-address').textContent = `${state.sheetName} · baris ${state.rowIndex + 1}`;
   $('r-nama').textContent = cell('nama') || '(kosong)';
   $('r-spek').textContent = cell('spesifikasi') || '-';
   $('r-misc').textContent = [cell('satuan') || '-', cell('merek') || '-'].join(' · ');
-  const cur = { level1: cell('level1'), level2: cell('level2'), level3: cell('level3') };
+  const cur = state.orig;
   $('c-l1').textContent = `Level 1: ${cur.level1 || '(kosong)'}`;
-  $('c-l2').textContent = `Level 2: ${cur.level2 || '(kosong)'}`;
+  $('c-l2').textContent = `Level 2: ${cur.level2 || '(kosong)'}${cur.kode2 ? ` (${cur.kode2})` : ''}`;
   $('c-l3').textContent = `Level 3: ${cur.level3 || '(kosong)'}`;
+  let invalid = false;
   if (ready) {
     const check = checkClassification(cur, state.master);
+    invalid = !check.ok;
     $('check').textContent = check.ok ? `✔ ${check.text}` : `✖ ${check.text}`;
     $('check').className = `check ${check.ok ? 'ok' : 'bad'}`;
   } else { $('check').textContent = 'Master belum dimuat.'; $('check').className = 'check'; }
 
-  const status = corrCell('status');
-  $('row-status').textContent = status || 'Belum ditinjau';
-  $('row-status').className = `badge ${keyOf(status).replace(/\s+/g, '') === 'valid' ? 'valid' : status === STATUS.corrected ? 'dikoreksi' : status === STATUS.review ? 'review' : ''}`;
-  const savedPath = [corrCell('level1'), corrCell('level2'), corrCell('level3')].filter(Boolean).join(' › ');
-  $('existing').textContent = savedPath ? `Koreksi tersimpan: ${savedPath}` : '';
-
-  // Saran
+  // Saran Level 3: hanya berguna bila klasifikasi tidak sesuai master.
   const box = $('suggestions'); box.replaceChildren();
-  const suggestions = ready ? suggest(cell('nama'), cell('spesifikasi'), state.master, CONFIG.suggestionLimit) : [];
+  const suggestions = ready && invalid ? suggest(cell('nama'), cell('spesifikasi'), state.master, CONFIG.suggestionLimit) : [];
   $('suggest-card').hidden = !suggestions.length;
-  for (const s of suggestions) for (const path of s.entries.slice(0, 3)) box.append(optionButton(path, pick));
-
-  // Hasil pencarian
-  const results = $('results'); results.replaceChildren();
-  const term = $('level3-search').value;
-  if (ready && tidy(term)) for (const path of filterPaths(state.master, term)) results.append(optionButton(path, pick));
-
-  const picked = $('picked'); picked.replaceChildren(); picked.hidden = !state.picked;
-  if (state.picked) {
-    const text = document.createElement('span');
-    text.textContent = `Level 3 baru: ${state.picked.level3} (${state.picked.level1} › ${state.picked.level2})`;
-    const clear = document.createElement('button'); clear.type = 'button'; clear.textContent = 'Batal';
-    clear.addEventListener('click', () => { state.picked = null; render(); });
-    picked.append(text, clear);
+  for (const s of suggestions) for (const path of s.entries.slice(0, 3)) {
+    const b = document.createElement('button'); b.type = 'button'; b.className = 'opt'; b.textContent = path.level3;
+    const small = document.createElement('small'); small.textContent = `${path.level1} › ${path.level2}`; b.append(small);
+    b.addEventListener('click', () => pickLevel3(path));
+    box.append(b);
   }
-  const lock = state.busy || !ready || needsSetup;
-  for (const id of ['save-corrected', 'save-valid', 'save-review', 'prev', 'next', 'next-pending']) $(id).disabled = lock && id.startsWith('save') ? true : state.busy;
+  for (const id of ['valid', 'prev', 'next', 'next-invalid']) $(id).disabled = state.busy;
+  renderEdit();
 }
 
-async function prepareColumns() {
-  await Excel.run(async context => {
-    const info = await readActiveRow(context);
-    if (!info.layout) throw new Error('Tata letak katalog tidak dikenali pada sheet aktif.');
-    const { plan, created } = planCorrectionColumns(info.layout);
-    const sheet = context.workbook.worksheets.getItem(info.sheetId);
-    for (const name of created) {
-      const head = sheet.getCell(info.layout.headerRow, plan[name]);
-      head.values = [[CORRECTION_HEADERS[name]]];
-      head.format.font.bold = true; head.format.fill.color = '#FFF2CC';
-      sheet.getRangeByIndexes(info.layout.headerRow, plan[name], 1, 1).format.columnWidth = name === 'note' ? 220 : 130;
-    }
-    const first = info.layout.headerRow + 1, count = Math.max(info.lastRow - info.layout.headerRow, 1);
-    const lists = { status: Object.values(STATUS).join(','), levelTarget: LEVEL_TARGETS.join(',') };
-    for (const [name, source] of Object.entries(lists)) {
-      const col = sheet.getRangeByIndexes(first, plan[name], count, 1);
-      col.dataValidation.clear();
-      col.dataValidation.rule = { list: { inCellDropDown: true, source } };
-    }
+// ───────────── Menyimpan ─────────────
+
+async function ensureNoteColumn(context, sheet, layout) {
+  if ('note' in layout.correction) return layout.correction.note;
+  const col = planCorrectionColumns(layout).plan.note;
+  const head = sheet.getCell(layout.headerRow, col);
+  head.values = [[CORRECTION_HEADERS.note]];
+  head.format.font.bold = true; head.format.fill.color = '#FFF2CC';
+  head.format.columnWidth = 220;
+  await context.sync();
+  return col;
+}
+
+async function appendLog(context, entries) {
+  if (!entries.length) return;
+  let sheet = context.workbook.worksheets.getItemOrNullObject(CONFIG.logSheet);
+  sheet.load('isNullObject'); await context.sync();
+  if (sheet.isNullObject) {
+    sheet = context.workbook.worksheets.add(CONFIG.logSheet);
+    const head = sheet.getRangeByIndexes(0, 0, 1, LOG_HEADERS.length);
+    head.values = [LOG_HEADERS]; head.format.font.bold = true; head.format.fill.color = '#D9EAD3';
+    sheet.freezePanes.freezeRows(1);
     await context.sync();
-  });
-  state.rowKey = '';
-  await refresh();
-  tell('Kolom koreksi siap di sisi kanan tabel.');
+  }
+  const used = sheet.getUsedRangeOrNullObject(true);
+  used.load('isNullObject,rowIndex,rowCount'); await context.sync();
+  const next = used.isNullObject ? 1 : used.rowIndex + used.rowCount;
+  const rows = entries.map(e => [e.time, e.sheet, e.rowFrom, e.rowTo, e.action, e.column, safeText(e.old), safeText(e.new), safeText(e.l1), safeText(e.l2), safeText(e.l3), safeText(e.nama), safeText(e.note)]);
+  sheet.getRangeByIndexes(next, 0, rows.length, LOG_HEADERS.length).values = rows;
+  await context.sync();
 }
 
-async function writeRow(statusLabel, requireContent) {
-  const layout = state.layout;
-  if (!layout?.hasAllCorrection) throw new Error('Siapkan kolom koreksi terlebih dahulu.');
-  const isValid = statusLabel === STATUS.valid;
-  const levelTarget = isValid ? LEVEL_TARGETS[0] : $('level-target').value;
-  const note = $('note').value;
-  if (requireContent) {
-    const meaningful = state.picked || (levelTarget && levelTarget !== LEVEL_TARGETS[0]) || tidy(note);
-    if (!meaningful) throw new Error('Pilih Level 3 yang benar, tentukan level seharusnya, atau isi catatan sebelum menyimpan koreksi.');
-  }
-  const values = buildCorrection({ status: statusLabel, levelTarget, path: isValid ? null : state.picked, note });
+const logBase = (sheetName, fields, note) => ({ time: formatTime(), sheet: sheetName, l1: fields.level1, l2: fields.level2, l3: fields.level3, nama: fields.nama, note: tidy(note) });
+
+async function saveCorrection() {
+  clearTimeout(noteTimer); pendingNote = null;
+  const orig = { ...state.orig }, draft = { ...state.draft };
+  const changes = diffFields(orig, draft);
+  if (!changes.length) throw new Error('Tidak ada perubahan untuk disimpan.');
+  const problem = pathProblem(draft, state.master);
+  if (problem) throw new Error(problem);
+  const move = $('move-row').checked, noteText = $('note').value;
   const target = { sheetId: state.sheetId, rowIndex: state.rowIndex };
+  const order = state.order;
+
+  const result = await Excel.run(async context => {
+    const active = await readActiveRow(context);
+    if (!active.layout || active.sheetId !== target.sheetId || active.rowIndex !== target.rowIndex) throw new Error('Baris aktif berubah. Pilih kembali baris yang ingin disimpan.');
+    const now = fieldsOfRow(active.row, active.layout);
+    if (COPY_FIELDS.some(f => f in active.layout.cols && tidy(now[f]) !== tidy(orig[f]))) throw new Error('Isi baris berubah sejak dibuka di panel. Pilih ulang baris ini untuk memuat nilai terbaru.');
+    const layout = active.layout, sheet = context.workbook.worksheets.getItem(target.sheetId), row = target.rowIndex;
+    const noteCol = await ensureNoteColumn(context, sheet, layout);
+    const storedNote = noteOf(active.row, layout);
+
+    for (const c of changes) {
+      if (!(c.field in layout.cols)) continue;
+      const range = sheet.getCell(row, layout.cols[c.field]);
+      range.values = [[safeText(c.new)]];
+      range.format.fill.color = CONFIG.changedFill;
+    }
+    if (tidy(noteText) !== storedNote) sheet.getCell(row, noteCol).values = [[safeText(noteText)]];
+    await context.sync();
+
+    let finalRow = row, moved = false;
+    if (move) {
+      const rows = await readIndex(context, sheet, layout, active.lastRow);
+      const self = { row };
+      const others = rows.filter(r => r.row !== row);
+      const insertBefore = computeMoveTarget(others, self, orig, draft, order);
+      if (insertBefore !== null) {
+        const width = Math.max(layout.lastUsed, noteCol) + 1;
+        sheet.getRangeByIndexes(insertBefore, 0, 1, 1).getEntireRow().insert(Excel.InsertShiftDirection.down);
+        await context.sync();
+        const srcIndex = row >= insertBefore ? row + 1 : row;
+        sheet.getRangeByIndexes(insertBefore, 0, 1, width).copyFrom(sheet.getRangeByIndexes(srcIndex, 0, 1, width), Excel.RangeCopyType.all);
+        await context.sync();
+        sheet.getRangeByIndexes(srcIndex, 0, 1, 1).getEntireRow().delete(Excel.DeleteShiftDirection.up);
+        await context.sync();
+        finalRow = finalRowAfterMove(row, insertBefore); moved = true;
+      }
+    }
+
+    const base = { ...logBase(active.sheetName, draft, noteText), rowFrom: row + 1, rowTo: finalRow + 1 };
+    const entries = changes.map(c => ({ ...base, action: 'Koreksi', column: FIELD_LABELS[c.field], old: c.old, new: c.new }));
+    if (moved) entries.push({ ...base, action: 'Pindah baris', column: '-', old: `Baris ${row + 1}`, new: `Baris ${finalRow + 1}` });
+    await appendLog(context, entries);
+
+    sheet.getCell(finalRow, layout.cols.nama).select();
+    await context.sync();
+    return { finalRow, moved };
+  });
+  state.index = null; state.rowKey = '';
+  await refresh();
+  tell(result.moved ? `Tersimpan. Baris dipindah ke baris ${result.finalRow + 1} (kelompok yang benar).` : `Tersimpan di baris ${result.finalRow + 1}.`);
+  if ($('auto-next').checked) await jumpToInvalid();
+}
+
+async function markValid() {
+  clearTimeout(noteTimer); pendingNote = null;
+  const noteText = $('note').value, target = { sheetId: state.sheetId, rowIndex: state.rowIndex }, fields = { ...state.orig };
   await Excel.run(async context => {
     const active = await readActiveRow(context);
-    if (active.sheetId !== target.sheetId || active.rowIndex !== target.rowIndex) throw new Error('Baris aktif berubah. Pilih kembali baris yang ingin disimpan.');
+    if (!active.layout || active.sheetId !== target.sheetId || active.rowIndex !== target.rowIndex) throw new Error('Baris aktif berubah. Pilih kembali baris yang ingin ditandai.');
     const sheet = context.workbook.worksheets.getItem(target.sheetId);
-    for (const [name, col] of Object.entries(layout.correction)) {
-      sheet.getCell(target.rowIndex, col).values = [[safeText(values[name])]];
+    if (tidy(noteText) !== noteOf(active.row, active.layout)) {
+      const col = await ensureNoteColumn(context, sheet, active.layout);
+      sheet.getCell(target.rowIndex, col).values = [[safeText(noteText)]];
+      await context.sync();
     }
-    await context.sync();
+    await appendLog(context, [{ ...logBase(active.sheetName, fields, noteText), rowFrom: target.rowIndex + 1, rowTo: target.rowIndex + 1, action: 'Valid', column: '-', old: '', new: '' }]);
   });
-  tell(`Baris ${target.rowIndex + 1}: ${statusLabel}.`);
+  tell(`Baris ${target.rowIndex + 1} ditandai valid (tercatat di sheet Log).`);
+  if ($('auto-next').checked) await jumpToInvalid(); else await go(Math.min(target.rowIndex + 1, state.lastRow));
 }
+
+async function writeNote(p) {
+  await Excel.run(async context => {
+    const sheet = context.workbook.worksheets.getItem(p.sheetId);
+    sheet.load('name'); await context.sync();
+    const layout = await loadLayout(context, sheet);
+    if (!layout) return;
+    const width = Math.max(layout.lastUsed, ...Object.values(layout.correction), 0) + 1;
+    const rowRange = sheet.getRangeByIndexes(p.rowIndex, 0, 1, width);
+    rowRange.load('values'); await context.sync();
+    const stored = noteOf(rowRange.values[0], layout);
+    if (tidy(p.text) === stored) return;
+    const col = await ensureNoteColumn(context, sheet, layout);
+    sheet.getCell(p.rowIndex, col).values = [[safeText(p.text)]];
+    await context.sync();
+    await appendLog(context, [{ ...logBase(sheet.name, fieldsOfRow(rowRange.values[0], layout), p.text), rowFrom: p.rowIndex + 1, rowTo: p.rowIndex + 1, action: 'Catatan', column: CORRECTION_HEADERS.note, old: stored, new: tidy(p.text) }]);
+  });
+  tell(`Catatan baris ${p.rowIndex + 1} tersimpan.`);
+}
+function flushNote() {
+  clearTimeout(noteTimer);
+  const p = pendingNote; pendingNote = null;
+  if (p) enqueue(() => writeNote(p));
+}
+
+// ───────────── Navigasi ─────────────
 
 async function go(rowIndex) {
-  if (rowIndex < 0) return;
+  if (rowIndex < 0 || !state.layout) return;
   await Excel.run(async context => {
-    const sheet = context.workbook.worksheets.getItem(state.sheetId);
-    const colIndex = state.layout.cols.nama;
-    sheet.getCell(rowIndex, colIndex).select();
+    context.workbook.worksheets.getItem(state.sheetId).getCell(rowIndex, state.layout.cols.nama).select();
     await context.sync();
   });
   await refresh();
 }
 
-async function findPending() {
-  const layout = state.layout;
-  if (!layout?.hasAllCorrection) throw new Error('Siapkan kolom koreksi terlebih dahulu.');
-  const startRow = Math.max(state.rowIndex, layout.headerRow);
-  const count = state.lastRow - startRow;
-  if (count <= 0) return -1;
-  const values = await Excel.run(async context => {
-    const range = context.workbook.worksheets.getItem(state.sheetId).getRangeByIndexes(startRow + 1, layout.correction.status, count, 1);
-    range.load('values'); await context.sync();
-    return range.values.map(r => r[0]);
+async function jumpToInvalid() {
+  if (!state.layout || !state.master) return;
+  const from = state.rowIndex, layout = state.layout, sheetId = state.sheetId;
+  const found = await Excel.run(async context => {
+    const rows = await readIndex(context, context.workbook.worksheets.getItem(sheetId), layout, state.lastRow);
+    return rows.find(r => r.row > from && !checkClassification(r, state.master).ok)?.row ?? -1;
   });
-  const idx = nextPending(values, -1);
-  return idx < 0 ? -1 : startRow + 1 + idx;
+  if (found < 0) { tell('Tidak ada lagi baris yang tidak sesuai master di bawah baris ini.'); return; }
+  await go(found);
 }
-
-async function afterSave() {
-  if ($('auto-next').checked) {
-    const row = await findPending();
-    if (row >= 0) { await go(row); return; }
-    tell('Selesai: tidak ada lagi baris yang belum ditinjau di bawah baris ini.');
-  }
-  await refresh();
-}
-
-async function save(label, requireContent) { await writeRow(label, requireContent); await afterSave(); }
 
 async function reload() {
-  const master = await Excel.run(readMaster);
-  state.master = master;
+  state.master = await Excel.run(readMaster);
+  state.order = masterOrder(state.master);
+  state.index = null; state.rowKey = '';
   await refresh();
-  tell(`Master_Level dimuat (${master.paths.length} baris).`);
+  tell(`Master_Level dimuat (${state.master.paths.length} baris).`);
 }
 
-for (const option of LEVEL_TARGETS) $('level-target').add(new Option(option, option));
-$('level3-search').addEventListener('input', render);
-$('save-corrected').addEventListener('click', () => enqueue(() => save(STATUS.corrected, true)));
-$('save-valid').addEventListener('click', () => enqueue(() => save(STATUS.valid, false)));
-$('save-review').addEventListener('click', () => enqueue(() => save(STATUS.review, false)));
-$('prepare').addEventListener('click', () => enqueue(prepareColumns));
+// ───────────── Event ─────────────
+
+$('save').addEventListener('click', () => enqueue(saveCorrection));
+$('valid').addEventListener('click', () => enqueue(markValid));
+$('reset').addEventListener('click', () => { if (state.orig) { state.draft = { ...state.orig }; syncInputs(); renderEdit(); } });
 $('reload').addEventListener('click', () => enqueue(reload));
 $('prev').addEventListener('click', () => enqueue(() => go(Math.max(state.rowIndex - 1, (state.layout?.headerRow ?? 0) + 1))));
 $('next').addEventListener('click', () => enqueue(() => go(Math.min(state.rowIndex + 1, state.lastRow))));
-$('next-pending').addEventListener('click', () => enqueue(async () => {
-  const row = await findPending();
-  if (row < 0) tell('Tidak ada baris yang belum ditinjau di bawah baris ini.'); else await go(row);
-}));
+$('next-invalid').addEventListener('click', () => enqueue(jumpToInvalid));
+$('note').addEventListener('input', () => {
+  if (!state.row) return;
+  pendingNote = { sheetId: state.sheetId, rowIndex: state.rowIndex, text: $('note').value };
+  clearTimeout(noteTimer); noteTimer = setTimeout(flushNote, 1200);
+});
+$('note').addEventListener('change', flushNote);
 
 if (typeof Office === 'undefined') {
   tell('Office.js belum termuat. Periksa koneksi ke layanan Microsoft dan buka melalui Add-ins di Excel.', true);
@@ -270,6 +465,7 @@ if (typeof Office === 'undefined') {
     enqueue(async () => {
       await Excel.run(async context => {
         context.workbook.onSelectionChanged.add(() => {
+          flushNote();
           clearTimeout(selectionTimer);
           selectionTimer = setTimeout(() => enqueue(refresh), 150);
         });

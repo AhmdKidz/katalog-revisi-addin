@@ -156,3 +156,125 @@ export function filterPaths(master, term, limit = 50) {
   }
   return out;
 }
+
+// ───────────────────────── v2: koreksi langsung pada baris ─────────────────────────
+
+const EDIT_ORDER = ['level1', 'kode2', 'level2', 'level3', 'nama', 'spesifikasi'];
+
+export function level1List(master) {
+  const seen = new Map();
+  for (const p of master.paths) if (p.level1 && !seen.has(keyOf(p.level1))) seen.set(keyOf(p.level1), p.level1);
+  return [...seen.values()];
+}
+
+/** Level 2 unik (beserta kode dan induk Level 1-nya). */
+export function level2Entries(master) {
+  const seen = new Map();
+  for (const p of master.paths) {
+    const id = `${keyOf(p.level1)}|${keyOf(p.level2)}`;
+    if (p.level2 && !seen.has(id)) seen.set(id, { level1: p.level1, kode2: p.kode2, level2: p.level2 });
+  }
+  return [...seen.values()];
+}
+
+export function findLevel2(master, level1, level2) {
+  return level2Entries(master).find(e => keyOf(e.level1) === keyOf(level1) && keyOf(e.level2) === keyOf(level2));
+}
+
+export function findPath(master, level1, level2, level3) {
+  return (master.byLevel3.get(keyOf(level3)) || []).find(p => keyOf(p.level1) === keyOf(level1) && keyOf(p.level2) === keyOf(level2));
+}
+
+/** Daftar perubahan antara nilai asli dan draf. */
+export function diffFields(orig, draft) {
+  const out = [];
+  for (const field of EDIT_ORDER) {
+    const before = tidy(orig[field]), after = tidy(draft[field]);
+    if (before !== after) out.push({ field, old: before, new: after });
+  }
+  return out;
+}
+
+/** Pesan masalah bila kombinasi Level 1/2/3 pada draf tidak ada di master. */
+export function pathProblem(draft, master) {
+  if (!tidy(draft.level1)) return 'Pilih Level 1.';
+  if (!tidy(draft.level2)) return 'Pilih Level 2.';
+  if (!tidy(draft.level3)) return 'Pilih Level 3 yang sesuai dengan Level 2.';
+  if (!findPath(master, draft.level1, draft.level2, draft.level3)) return 'Kombinasi Level 1, Level 2, dan Level 3 tidak ada di Master_Level.';
+  return '';
+}
+
+const pathKey = (l1, l2, l3) => `${keyOf(l1)}|${keyOf(l2)}|${keyOf(l3)}`;
+
+/** Urutan tiap klasifikasi di Master_Level (dipakai untuk menentukan kelompok tujuan). */
+export function masterOrder(master) {
+  const order = new Map();
+  master.paths.forEach((p, i) => { const k = pathKey(p.level1, p.level2, p.level3); if (!order.has(k)) order.set(k, i); });
+  return order;
+}
+
+/**
+ * Menentukan posisi baru sebuah baris setelah dikoreksi.
+ * `rows` = semua baris data KECUALI baris yang dikoreksi: { row, level1, level2, level3, nama }.
+ * Hasil: indeks baris (absolut) tempat baris disisipkan SEBELUM-nya, atau null bila tetap di tempat.
+ */
+export function computeMoveTarget(rows, self, orig, updated, order) {
+  const sameGroup = keyOf(orig.level1) === keyOf(updated.level1) && keyOf(orig.level2) === keyOf(updated.level2) && keyOf(orig.level3) === keyOf(updated.level3);
+  if (sameGroup && keyOf(orig.nama) === keyOf(updated.nama)) return null;
+  const me = pathKey(updated.level1, updated.level2, updated.level3);
+  const group = rows.filter(r => pathKey(r.level1, r.level2, r.level3) === me);
+  let insertBefore = null;
+  if (group.length) {
+    const byName = group.filter(r => keyOf(r.nama) === keyOf(updated.nama));
+    const anchor = byName.length ? byName : group;
+    insertBefore = Math.max(...anchor.map(r => r.row)) + 1;
+  } else {
+    const mine = order.get(me);
+    if (mine === undefined) return null;
+    const known = rows.map(r => ({ r, key: order.get(pathKey(r.level1, r.level2, r.level3)) })).filter(k => k.key !== undefined);
+    if (!known.length) return null;
+    const before = known.filter(k => k.key <= mine);
+    if (before.length) {
+      const best = Math.max(...before.map(k => k.key));
+      insertBefore = Math.max(...before.filter(k => k.key === best).map(k => k.r.row)) + 1;
+    } else {
+      const first = Math.min(...known.map(k => k.key));
+      insertBefore = Math.min(...known.filter(k => k.key === first).map(k => k.r.row));
+    }
+  }
+  if (insertBefore === self.row || insertBefore === self.row + 1) return null;
+  return insertBefore;
+}
+
+/** Nomor baris akhir setelah baris dipindah dari `from` ke posisi sebelum `insertBefore`. */
+export const finalRowAfterMove = (from, insertBefore) => (from < insertBefore ? insertBefore - 1 : insertBefore);
+
+/** Pilihan isian bebas (Nama / Spesifikasi) dari nilai yang sudah ada di sheet. */
+export function valueOptions(rows, field, draft, text, browse, limit = 60) {
+  const l3 = keyOf(draft.level3), nm = keyOf(draft.nama);
+  const counts = new Map();
+  for (const r of rows) {
+    const value = r[field];
+    if (!value) continue;
+    const k = keyOf(value);
+    let e = counts.get(k);
+    if (!e) { e = { label: value, n: 0, rank: 2 }; counts.set(k, e); }
+    e.n++;
+    const inL3 = keyOf(r.level3) === l3;
+    const rank = field === 'nama' ? (inL3 ? 0 : 2) : (inL3 && keyOf(r.nama) === nm ? 0 : inL3 ? 1 : 2);
+    if (rank < e.rank) e.rank = rank;
+  }
+  let list = [...counts.values()];
+  const q = keyOf(text);
+  if (browse || !q) {
+    const best = list.filter(e => e.rank === 0);
+    list = best.length ? best : list.filter(e => e.rank < 2).length ? list.filter(e => e.rank < 2) : list;
+  } else list = list.filter(e => keyOf(e.label).includes(q));
+  list.sort((a, b) => a.rank - b.rank || b.n - a.n || a.label.localeCompare(b.label, 'id'));
+  return list.slice(0, limit).map(e => ({ label: e.label, sub: `${e.n} baris${e.rank === 0 ? ' · kelompok sama' : ''}`, data: e.label }));
+}
+
+export function formatTime(date = new Date()) {
+  const p = n => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())} ${p(date.getHours())}:${p(date.getMinutes())}:${p(date.getSeconds())}`;
+}

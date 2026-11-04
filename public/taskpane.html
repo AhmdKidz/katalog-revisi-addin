@@ -9,7 +9,7 @@
   <script type="module" src="app.js"></script>
 </head>
 <body>
-  <header><h1>Koreksi Klasifikasi</h1><p>Katalog Sumber Daya · v1.0</p></header>
+  <header><h1>Koreksi Klasifikasi</h1><p>Katalog Sumber Daya · v2.0</p></header>
   <main>
     <p id="connection" role="status">Buka panel ini melalui Add-ins di Excel.</p>
     <p id="message" role="status" aria-live="polite"></p>
@@ -19,14 +19,11 @@
       <span id="count"></span>
     </section>
 
-    <section id="setup" hidden>
-      <p id="setup-text"></p>
-      <button id="prepare" type="button" class="primary">Siapkan kolom koreksi</button>
-    </section>
+    <section id="setup" hidden><p id="setup-text"></p></section>
 
     <section id="row-card" hidden>
       <div class="card">
-        <div class="row-head"><strong id="row-address">Baris -</strong><span id="row-status" class="badge"></span></div>
+        <div class="row-head"><strong id="row-address">Baris -</strong></div>
         <dl>
           <dt>Nama produk / pekerjaan</dt><dd id="r-nama"></dd>
           <dt>Spesifikasi</dt><dd id="r-spek"></dd>
@@ -38,39 +35,63 @@
         <h2>Klasifikasi saat ini</h2>
         <ul class="path"><li id="c-l1"></li><li id="c-l2"></li><li id="c-l3"></li></ul>
         <p id="check" class="check"></p>
-        <p id="existing" class="secondary"></p>
-      </div>
-
-      <div class="card" id="suggest-card" hidden>
-        <h2>Saran dari nama produk</h2>
-        <div id="suggestions"></div>
+        <details id="suggest-card" hidden>
+          <summary>Saran Level 3 dari nama produk</summary>
+          <div id="suggestions"></div>
+        </details>
       </div>
 
       <div class="card">
         <h2>Koreksi</h2>
-        <label for="level3-search">Cari Level 3 yang benar</label>
-        <input id="level3-search" type="text" autocomplete="off" placeholder="Ketik nama Level 3 / Level 2">
-        <div id="results" class="results" role="listbox" aria-label="Hasil pencarian Level 3"></div>
-        <div id="picked" class="picked" hidden></div>
+        <p class="secondary">Ubah kolom yang salah saja. Kolom yang berubah akan diwarnai kuning di baris ini.</p>
 
-        <label for="level-target">Nama produk/pekerjaan ini seharusnya berada di</label>
-        <select id="level-target"></select>
+        <label for="level1">Level 1</label>
+        <select id="level1"></select>
 
-        <label for="note">Catatan</label>
-        <textarea id="note" rows="2" placeholder="Opsional. Mis. 'Merek ikut terbawa di nama produk'"></textarea>
+        <label for="level2-input">Level 2 <span id="kode2" class="kode"></span></label>
+        <div class="combo">
+          <div class="combo-field"><input id="level2-input" type="text" role="combobox" aria-expanded="false" autocomplete="off" placeholder="Ketik atau klik panah"><button id="level2-toggle" type="button" aria-label="Daftar Level 2" aria-expanded="false">▾</button></div>
+          <div id="level2-list" class="results" role="listbox" hidden></div>
+        </div>
+
+        <label for="level3-input">Level 3</label>
+        <div class="combo">
+          <div class="combo-field"><input id="level3-input" type="text" role="combobox" aria-expanded="false" autocomplete="off" placeholder="Ketik atau klik panah"><button id="level3-toggle" type="button" aria-label="Daftar Level 3" aria-expanded="false">▾</button></div>
+          <div id="level3-list" class="results" role="listbox" hidden></div>
+        </div>
+
+        <label for="nama-input">Nama Produk / Pekerjaan</label>
+        <div class="combo">
+          <div class="combo-field"><input id="nama-input" type="text" role="combobox" aria-expanded="false" autocomplete="off" placeholder="Ketik atau klik panah"><button id="nama-toggle" type="button" aria-label="Daftar nama" aria-expanded="false">▾</button></div>
+          <div id="nama-list" class="results" role="listbox" hidden></div>
+        </div>
+
+        <label for="spek-input">Spesifikasi</label>
+        <div class="combo">
+          <div class="combo-field"><input id="spek-input" type="text" role="combobox" aria-expanded="false" autocomplete="off" placeholder="Ketik atau klik panah"><button id="spek-toggle" type="button" aria-label="Daftar spesifikasi" aria-expanded="false">▾</button></div>
+          <div id="spek-list" class="results" role="listbox" hidden></div>
+        </div>
+
+        <label for="note">Catatan (tersimpan otomatis di kolom Catatan Koreksi)</label>
+        <textarea id="note" rows="2" placeholder="Opsional"></textarea>
+
+        <div id="changes" class="changes" hidden></div>
+        <p id="problem" class="problem" hidden></p>
+
+        <label class="inline"><input id="move-row" type="checkbox" checked> Pindahkan baris ke kelompok yang benar setelah koreksi</label>
+        <label class="inline"><input id="auto-next" type="checkbox"> Setelah menyimpan, lompat ke baris berikutnya yang tidak sesuai master</label>
 
         <div class="actions">
-          <button id="save-corrected" type="button" class="primary">Simpan koreksi</button>
-          <button id="save-valid" type="button">Tandai valid</button>
-          <button id="save-review" type="button">Perlu review</button>
+          <button id="save" type="button" class="primary">Simpan koreksi</button>
+          <button id="valid" type="button">Sudah valid</button>
+          <button id="reset" type="button">Kembalikan</button>
         </div>
-        <label class="inline"><input id="auto-next" type="checkbox" checked> Setelah menyimpan, pindah ke baris berikutnya yang belum ditinjau</label>
       </div>
 
       <div class="nav">
-        <button id="prev" type="button">◀ Baris sebelumnya</button>
+        <button id="prev" type="button">◀ Sebelumnya</button>
         <button id="next" type="button">Berikutnya ▶</button>
-        <button id="next-pending" type="button">Belum ditinjau ⏭</button>
+        <button id="next-invalid" type="button">Tidak sesuai master ⏭</button>
       </div>
     </section>
   </main>

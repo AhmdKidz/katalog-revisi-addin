@@ -32,3 +32,18 @@ button.primary { background: var(--accent); color: #fff; border-color: var(--acc
 #message { min-height: 18px; margin: 6px 0; font-weight: 600; color: var(--ok); } #message.error { color: var(--bad); }
 #setup { background: #fff8c5; border: 1px solid #eac54f; border-radius: 6px; padding: 10px; margin: 8px 0; }
 #suggestions .opt { border: 1px solid var(--line); border-radius: 4px; margin-bottom: 4px; }
+
+
+/* v2 */
+.combo { position: relative; }
+.combo-field { display: flex; }
+.combo-field input { border-radius: 4px 0 0 4px; }
+.combo-field button { border-radius: 0 4px 4px 0; border-left: 0; }
+.combo .results { position: absolute; z-index: 5; left: 0; right: 0; background: #fff; box-shadow: 0 4px 12px rgba(0,0,0,.15); }
+.opt.active { background: #ddf4ff; }
+.empty { padding: 8px; color: #57606a; }
+.kode { font-weight: 400; color: #57606a; }
+.changes { margin: 8px 0; padding: 6px 8px; background: #fffbdd; border: 1px solid #eac54f; border-radius: 4px; }
+.changes div { padding: 1px 0; }
+.problem { color: var(--bad); font-weight: 600; margin: 6px 0; }
+details summary { cursor: pointer; color: #0969da; margin-top: 6px; }
